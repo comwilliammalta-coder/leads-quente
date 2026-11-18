@@ -26,4 +26,4 @@ jobs:
           TRELLO_BOARD_ID: "6afc5dda5caa26aa78fbd51a"
           TRELLO_LIST_ID: "6afc5ddd8fb5cc83dd7319a1"
           TRELLO_REPLIED_LIST_ID: "6afc8e14c229a83c3755f7c3"
-        run: python sync_hot_leads-2.py
+        run: python sync_leads_trello.py
