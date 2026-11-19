@@ -180,15 +180,74 @@ def sync_hot(cards, project_id, project_name):
     print(f"[{project_name}] Quentes -> criados: {created} | atualizados: {updated} | movidos de Responderam: {moved}")
 
 
-def last_message_text(thread):
-    messages = []
-    if isinstance(thread, dict):
-        messages = as_list(thread.get("messages") or thread.get("thread") or thread)
-    for message in reversed(messages):
+THREAD_START = "<!--conversa-->"
+THREAD_END = "<!--/conversa-->"
+DESC_LIMIT = 15500  # o Trello aceita até 16384 caracteres na descrição
+
+
+def thread_messages(thread):
+    if not isinstance(thread, dict):
+        return []
+    return [m for m in as_list(thread.get("messages") or thread.get("thread") or thread)
+            if isinstance(m, dict)]
+
+
+def message_who(message):
+    direction = str(pick(message, "direction", "type", "kind", "role", "event_type") or "").lower()
+    if any(word in direction for word in ("out", "sent", "agent", "assistant")):
+        return "Nós"
+    if any(word in direction for word in ("in", "reply", "receiv", "lead")):
+        return "Lead"
+    return str(pick(message, "from_name", "from_email", "sender", "from") or "Mensagem")
+
+
+def message_date(message):
+    return pick(message, "sent_at", "received_at", "created_at", "date", "timestamp") or ""
+
+
+def full_thread_text(thread):
+    """Conversa inteira, da mais antiga para a mais recente."""
+    messages = thread_messages(thread)
+    messages = sorted(messages, key=message_date)  # estável: sem data, mantém a ordem original
+    blocks = []
+    for message in messages:
         text = pick(message, "body_text", "text", "body", "content", "snippet")
-        if text:
-            return str(text).strip()[:1500]
-    return None
+        if not text:
+            continue
+        text = str(text).strip()
+        if len(text) > 1500:
+            text = text[:1500] + " [...]"
+        text = text.replace("\n", "\n> ")
+        blocks.append(f"**{message_who(message)}** ({message_date(message) or 's/ data'}):\n> {text}")
+    if not blocks:
+        return None
+    joined = "\n\n".join(blocks)
+    if len(joined) > DESC_LIMIT - 1500:  # sem estourar o limite, fica com as mensagens mais recentes
+        joined = "[...mensagens mais antigas omitidas...]\n\n" + joined[-(DESC_LIMIT - 1600):]
+    return joined
+
+
+def thread_section(thread, reply_count):
+    body = full_thread_text(thread) or "-"
+    return "\n".join([
+        THREAD_START,
+        f"**Conversa completa ({len(thread_messages(thread))} mensagens):**",
+        "",
+        body,
+        "",
+        f"`explee_reply_count: {reply_count}`",
+        THREAD_END,
+    ])
+
+
+def with_thread(desc, section):
+    """Troca (ou acrescenta) a seção da conversa na descrição do cartão."""
+    if THREAD_START in desc and THREAD_END in desc:
+        before = desc.split(THREAD_START)[0].rstrip()
+        after = desc.split(THREAD_END, 1)[1].strip()
+        desc = before + ("\n\n" + after if after else "")
+    base = desc.rstrip()
+    return base[: DESC_LIMIT - len(section) - 2] + "\n\n" + section
 
 
 def sync_replied(cards, project_id, project_name, budget):
@@ -196,18 +255,31 @@ def sync_replied(cards, project_id, project_name, budget):
     print(f"[{project_name}] Conversas com resposta retornadas: {len(items)}")
     if items:
         print("Campos de uma conversa (só nomes):", sorted(items[0].keys()))
-    created = skipped = 0
+    created = skipped = updated = 0
     for item in items:
         person_id = str(item.get("person_id") or "")
         campaign_id = item.get("campaign_id")
         key = f"{project_id}:{person_id}"
-        if not person_id or not campaign_id or key in cards:
+        if not person_id or not campaign_id:
+            continue
+        if key in cards:
+            card = cards[key]
+            reply_count = str(item.get("reply_count") or "")
+            if marker(card["desc"], "explee_reply_count") == reply_count:
+                continue  # conversa já está completa e atualizada
+            if updated + created >= budget:
+                continue
+            thread = explee(f"/autogtm/campaigns/{campaign_id}/inbox/{person_id}")
+            new_desc = with_thread(card["desc"], thread_section(thread, reply_count))
+            trello(f"/cards/{card['id']}", "PUT", desc=new_desc)
+            card["desc"] = new_desc
+            updated += 1
             continue
         intent = str(item.get("latest_intent") or "").lower()
         if item.get("erased") or any(word in intent for word in ("unsub", "bounce")):
             skipped += 1  # apagados, descadastrados ou e-mail inválido: não contatar
             continue
-        if created >= budget:
+        if created + updated >= budget:
             break
         thread = explee(f"/autogtm/campaigns/{campaign_id}/inbox/{person_id}")
         if created == 0 and isinstance(thread, dict):
@@ -220,8 +292,6 @@ def sync_replied(cards, project_id, project_name, budget):
         title = f"[{tag(project_name)}] {name}" + (f" — {company}" if company else "")
         desc = "\n".join([
             f"**Projeto:** {project_name}",
-            "",
-            f"**Última mensagem da conversa:**\n> {last_message_text(thread) or '-'}",
             "",
             f"- Assunto: {item.get('latest_subject') or '-'}",
             f"- Intenção detectada: {item.get('latest_intent') or '-'} | Status: {item.get('lead_status') or '-'}",
@@ -236,11 +306,12 @@ def sync_replied(cards, project_id, project_name, budget):
             f"`explee_person_id: {person_id}`",
             f"`explee_campaign_id: {campaign_id}`",
         ])
+        desc = with_thread(desc, thread_section(thread, str(item.get("reply_count") or "")))
         new = trello("/cards", "POST", idList=REPLIED_LIST_ID, name=title, desc=desc, pos="top")
         cards[key] = {"id": new["id"], "desc": desc, "idList": REPLIED_LIST_ID}
         created += 1
-    print(f"[{project_name}] Responderam -> criados: {created} | ignorados (descadastrados/apagados): {skipped}")
-    return created
+    print(f"[{project_name}] Responderam -> criados: {created} | conversas atualizadas: {updated} | ignorados (descadastrados/apagados): {skipped}")
+    return created + updated
 
 
 def main():
