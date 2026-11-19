@@ -165,6 +165,7 @@ def sync_hot(cards, project_id, project_name):
             created += 1
             continue
         changed = marker(card["desc"], "explee_became_hot_at") != (lead.get("became_hot_at") or "")
+        desc = keep_thread(desc, card["desc"])
         if card["idList"] == REPLIED_LIST_ID:
             trello(f"/cards/{card['id']}", "PUT", idList=HOT_LIST_ID, desc=desc, pos="top")
             trello(f"/cards/{card['id']}/actions/comments", "POST",
@@ -238,6 +239,18 @@ def thread_section(thread, reply_count):
         f"`explee_reply_count: {reply_count}`",
         THREAD_END,
     ])
+
+
+def existing_section(desc):
+    if THREAD_START in desc and THREAD_END in desc:
+        return THREAD_START + desc.split(THREAD_START, 1)[1].split(THREAD_END, 1)[0] + THREAD_END
+    return None
+
+
+def keep_thread(new_desc, old_desc):
+    """Ao regravar a descrição de um cartão quente, mantém a conversa já salva."""
+    section = existing_section(old_desc or "")
+    return with_thread(new_desc, section) if section else new_desc
 
 
 def with_thread(desc, section):
@@ -332,6 +345,9 @@ def main():
         if budget <= 0:
             print("Limite de cartões por execução atingido; o resto entra na próxima.")
             break
+    sem_conversa = [c for c in cards.values()
+                    if c["idList"] == HOT_LIST_ID and "explee_reply_count" not in c["desc"]]
+    print(f"Cartões em Novos leads quentes ainda sem a conversa completa: {len(sem_conversa)}")
 
 
 if __name__ == "__main__":
